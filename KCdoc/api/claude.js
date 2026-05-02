@@ -3,7 +3,7 @@ module.exports = async function handler(req, res) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return res.status(500).json({ error: "Missing API key" });
   try {
-    const body = { ...req.body, model: "claude-3-5-haiku-20241022" };
+    const body = { ...req.body, model: "claude-3-5-sonnet-20240620" };
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
