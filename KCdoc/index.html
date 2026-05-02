@@ -541,7 +541,7 @@ function App() {
     return NOTION_SEED;
   });
 
-  const persistWords = (w) => { setWords(w); saveLocal(w); };
+  const persistWords = (w) => { setWords(w); saveLocal(w); saveToRedis(w); };
 
   const addWord = async (wordData) => {
     if (words.find(w => w.word.toLowerCase() === wordData.word.toLowerCase())) return false;
