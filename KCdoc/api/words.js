@@ -2,48 +2,42 @@ module.exports = async function handler(req, res) {
   const redisUrl = process.env.REDIS_URL;
   if (!redisUrl) return res.status(500).json({ error: "No Redis URL" });
 
-  // Parse Upstash Redis URL: redis://default:PASSWORD@HOST:PORT
+  // Parse redis://default:PASSWORD@HOST:PORT
   const url = new URL(redisUrl);
-  const password = url.password;
   const host = url.hostname;
-  const restUrl = `https://${host}`;
+  const port = url.port || 6379;
+  const password = url.password;
 
-  async function redisGet(key) {
-    const r = await fetch(`${restUrl}/get/${key}`, {
-      headers: { Authorization: `Bearer ${password}` }
-    });
-    const data = await r.json();
-    return data.result;
-  }
+  // Use Upstash-compatible REST via direct TCP is not possible in serverless
+  // Use node's net module won't work either - use ioredis via dynamic import
+  // Instead, use a simple HTTP-based Redis REST approach with redislabs
+  // Actually use the @upstash/redis pattern with fetch to Redis REST API
 
-  async function redisSet(key, value) {
-    const r = await fetch(`${restUrl}/set/${key}`, {
-      method: "POST",
-      headers: { 
-        Authorization: `Bearer ${password}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ value })
-    });
-    return r.json();
-  }
+  // For Redis Labs, we need to use a different approach
+  // Let's use a simple in-memory workaround with Vercel's built-in storage
+  // by calling redis commands via HTTP using the redis-cli REST endpoint
 
-  if (req.method === "GET") {
-    try {
-      const result = await redisGet("words");
+  const { createClient } = await import('redis');
+  
+  const client = createClient({ url: redisUrl });
+  await client.connect();
+
+  try {
+    if (req.method === "GET") {
+      const result = await client.get("words");
       const words = result ? JSON.parse(result) : [];
+      await client.disconnect();
       res.status(200).json(words);
-    } catch (e) {
-      res.status(500).json({ error: e.message });
-    }
-  } else if (req.method === "POST") {
-    try {
-      await redisSet("words", JSON.stringify(req.body));
+    } else if (req.method === "POST") {
+      await client.set("words", JSON.stringify(req.body));
+      await client.disconnect();
       res.status(200).json({ ok: true });
-    } catch (e) {
-      res.status(500).json({ error: e.message });
+    } else {
+      await client.disconnect();
+      res.status(405).end();
     }
-  } else {
-    res.status(405).end();
+  } catch (e) {
+    await client.disconnect().catch(() => {});
+    res.status(500).json({ error: e.message });
   }
 };
