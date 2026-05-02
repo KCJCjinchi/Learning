@@ -571,15 +571,7 @@ function App() {
 
   const dueWords = words.filter(isDueToday);
 
-  if (loading) return (
-    <>
-      <style>{style}</style>
-      <div className="app">
-        <div className="nav"><span className="nav-title">WordDeck</span></div>
-        <div className="loading"><div className="spinner"/><span>載入單字中...</span></div>
-      </div>
-    </>
-  );
+
 
   return (
     <>
