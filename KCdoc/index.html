@@ -1,0 +1,1259 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="theme-color" content="#0d0d0d" />
+  <title>WordDeck</title>
+  <style>body { margin: 0; background: #0d0d0d; }</style>
+</head>
+<body>
+  <div id="root"></div>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+
+// ── Spaced repetition helpers ──────────────────────────────────────────────
+function nextReview(level) {
+  const days = [0, 1, 3, 7, 14, 30];
+  const d = days[Math.min(level, days.length - 1)];
+  const t = new Date();
+  t.setDate(t.getDate() + d);
+  t.setHours(0, 0, 0, 0);
+  return t.getTime();
+}
+
+function isDueToday(word) {
+  const now = new Date();
+  now.setHours(0, 0, 0, 0);
+  return !word.nextReview || word.nextReview <= now.getTime();
+}
+
+function randEx(w) {
+  const exs = w.examples;
+  if (!exs || exs.length === 0) return { sentence: w.example || "", translation: "", source: "" };
+  return exs[Math.floor(Math.random() * exs.length)];
+}
+
+// ── Claude API ─────────────────────────────────────────────────────────────
+async function lookupWord(word) {
+  const prompt = `Look up the English word or phrase "${word}" and return ONLY a JSON object (no markdown, no explanation) with this exact structure:
+{
+  "word": "${word}",
+  "pos": "part of speech abbreviation (n./v./adj./adv./phrase etc.)",
+  "definitions": ["definition 1 in Traditional Chinese", "definition 2 if exists"],
+  "examples": [
+    {
+      "sentence": "A real or realistic example sentence inspired by news, journalism or current affairs (e.g. The Economist, NYT, BBC)",
+      "translation": "Traditional Chinese translation",
+      "source": "Source name e.g. The Economist"
+    },
+    {
+      "sentence": "Another example sentence from a different domain such as science, academia or literature",
+      "translation": "Traditional Chinese translation",
+      "source": "Source name e.g. Scientific American"
+    },
+    {
+      "sentence": "A third example sentence from yet another context such as business, politics or culture",
+      "translation": "Traditional Chinese translation",
+      "source": "Source name e.g. Financial Times"
+    }
+  ],
+  "roots": [{"root": "root or prefix/suffix", "meaning": "what it means in Chinese"}],
+  "related": ["related word 1", "related word 2", "related word 3"]
+}`;
+
+  const res = await fetch("/api/claude", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 1000,
+      messages: [{ role: "user", content: prompt }],
+    }),
+  });
+  const data = await res.json();
+  const text = data.content.map((b) => b.text || "").join("");
+  const clean = text.replace(/```json|```/g, "").trim();
+  return JSON.parse(clean);
+}
+
+// ── Notion Sync ────────────────────────────────────────────────────────────
+const NOTION_DB_ID = "63917643-ebac-41e1-b8a9-8db603f9d25c";
+const NOTION_DS_ID = "c54e4878-6eff-4e39-924e-77891b1dd848";
+const LEVEL_LABEL = ["🔴 新學","🟠 學習中","🟠 學習中","🟢 熟悉","🟢 熟悉","✅ 已掌握"];
+
+// Fetch all words from Notion
+async function fetchFromNotion() {
+  const prompt = `Use the Notion MCP to query all pages in the WordDeck database with database_id "${NOTION_DB_ID}". Return ONLY a JSON array (no markdown) of objects with these fields from each page:
+{ "notionId": "<page id>", "word": "<單字>", "pos": "<詞性>", "definitions": ["<字義 split by ；>"], "example": "<第一個例句>", "examples": [], "roots": [], "related": [], "level": <0-5 based on 學習程度: 🔴=0,🟠=1,🟢=3,✅=5>, "nextReview": <unix ms timestamp from 下次複習 date or 0> }
+Return [] if database is empty.`;
+  const res = await fetch("/api/claude", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 4000,
+      messages: [{ role: "user", content: prompt }],
+      mcp_servers: [{ type: "url", url: "https://mcp.notion.com/mcp", name: "notion-mcp" }],
+    }),
+  });
+  const data = await res.json();
+  const text = data.content.map(b => b.text || "").join("");
+  const clean = text.replace(/```json|```/g, "").trim();
+  const match = clean.match(/\[[\s\S]*\]/);
+  if (!match) return [];
+  const arr = JSON.parse(match[0]);
+  return arr.map((w, i) => ({ ...w, id: w.notionId || Date.now() + i }));
+}
+
+// Add word to Notion
+async function addToNotion(wordData) {
+  const today = new Date().toISOString().split("T")[0];
+  const nextReviewDate = new Date(nextReview(0)).toISOString().split("T")[0];
+  const prompt = `Use the Notion MCP to create a page in the WordDeck database (data_source_id: "${NOTION_DS_ID}") with these exact properties:
+- 單字 (title): "${wordData.word}"
+- 詞性: "${wordData.pos}"
+- 字義: "${wordData.definitions?.join("；")}"
+- 例句: "${wordData.examples?.map(e => "[" + e.source + "] " + e.sentence).join(" ／ ") || wordData.example || ""}"
+- 例句翻譯: "${wordData.examples?.map(e => e.translation).join(" ／ ") || wordData.exampleTranslation || ""}"
+- 字根字詞: "${wordData.roots?.map(r => r.root + "（" + r.meaning + "）").join("、") || ""}"
+- 相關單字: "${wordData.related?.join("、") || ""}"
+- 學習程度: "🔴 新學"
+- 加入日期: "${today}"
+- 下次複習: "${nextReviewDate}"
+Call notion create-pages now. Return the new page id only.`;
+  const res = await fetch("/api/claude", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 500,
+      messages: [{ role: "user", content: prompt }],
+      mcp_servers: [{ type: "url", url: "https://mcp.notion.com/mcp", name: "notion-mcp" }],
+    }),
+  });
+  const data = await res.json();
+  const text = data.content.map(b => b.text || "").join("");
+  const idMatch = text.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+  return idMatch ? idMatch[0] : null;
+}
+
+// Update word level + nextReview in Notion
+async function updateInNotion(notionId, level) {
+  const nextReviewDate = new Date(nextReview(level)).toISOString().split("T")[0];
+  const prompt = `Use Notion MCP to update page "${notionId}" with:
+- 學習程度: "${LEVEL_LABEL[Math.min(level,5)]}"
+- 下次複習: "${nextReviewDate}"
+Call notion update-page now.`;
+  await fetch("/api/claude", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 300,
+      messages: [{ role: "user", content: prompt }],
+      mcp_servers: [{ type: "url", url: "https://mcp.notion.com/mcp", name: "notion-mcp" }],
+    }),
+  });
+}
+
+// Delete word from Notion
+async function deleteFromNotion(notionId) {
+  const prompt = `Use Notion MCP to archive (delete) page with id "${notionId}". Call the tool now.`;
+  await fetch("/api/claude", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 200,
+      messages: [{ role: "user", content: prompt }],
+      mcp_servers: [{ type: "url", url: "https://mcp.notion.com/mcp", name: "notion-mcp" }],
+    }),
+  });
+}
+
+// ── Text-to-Speech ─────────────────────────────────────────────────────────
+function speak(text) {
+  if (!window.speechSynthesis) return;
+  window.speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = "en-US";
+  u.rate = 0.9;
+  window.speechSynthesis.speak(u);
+}
+
+function SpeakBtn({ text, style: s }) {
+  const [speaking, setSpeaking] = useState(false);
+  const handle = (e) => {
+    e.stopPropagation();
+    if (!window.speechSynthesis) return;
+    window.speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = "en-US"; u.rate = 0.9;
+    u.onstart = () => setSpeaking(true);
+    u.onend = () => setSpeaking(false);
+    window.speechSynthesis.speak(u);
+  };
+  return (
+    <button onClick={handle} style={{
+      background: speaking ? "rgba(232,197,71,0.2)" : "rgba(255,255,255,0.06)",
+      border: `1px solid ${speaking ? "var(--accent)" : "var(--border)"}`,
+      borderRadius: 8, padding: "5px 10px", cursor: "pointer",
+      color: speaking ? "var(--accent)" : "var(--muted)",
+      fontSize: 16, lineHeight: 1, transition: "all 0.2s", ...s
+    }}>
+      {speaking ? "🔊" : "🔈"}
+    </button>
+  );
+}
+
+
+const style = `
+  @import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Mono:wght@400;500&family=DM+Sans:wght@300;400;500&display=swap');
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #0d0d0d;
+    --surface: #161616;
+    --card: #1e1e1e;
+    --border: #2a2a2a;
+    --accent: #e8c547;
+    --accent2: #4a9eff;
+    --text: #f0ede8;
+    --muted: #666;
+    --success: #5cb87a;
+    --danger: #e05c5c;
+    --radius: 16px;
+  }
+
+  body { background: var(--bg); color: var(--text); font-family: 'DM Sans', sans-serif; min-height: 100vh; }
+
+  .app { max-width: 480px; margin: 0 auto; padding: 0 0 80px; min-height: 100vh; position: relative; }
+
+  /* NAV */
+  .nav {
+    position: sticky; top: 0; z-index: 100;
+    background: rgba(13,13,13,0.85); backdrop-filter: blur(20px);
+    border-bottom: 1px solid var(--border);
+    padding: 16px 20px;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .nav-title { font-family: 'DM Serif Display', serif; font-size: 20px; color: var(--accent); }
+  .nav-badge {
+    background: var(--accent); color: #000; font-size: 11px; font-weight: 500;
+    padding: 3px 10px; border-radius: 20px; font-family: 'DM Mono', monospace;
+  }
+
+  /* BOTTOM TAB */
+  .tabs {
+    position: fixed; bottom: 0; left: 50%; transform: translateX(-50%);
+    width: 100%; max-width: 480px;
+    background: rgba(22,22,22,0.95); backdrop-filter: blur(20px);
+    border-top: 1px solid var(--border);
+    display: flex;
+  }
+  .tab {
+    flex: 1; padding: 12px 4px; border: none; background: none; cursor: pointer;
+    color: var(--muted); display: flex; flex-direction: column; align-items: center; gap: 4px;
+    font-size: 10px; font-family: 'DM Sans', sans-serif; transition: color 0.2s;
+  }
+  .tab.active { color: var(--accent); }
+  .tab svg { width: 22px; height: 22px; }
+
+  /* PAGE PADDING */
+  .page { padding: 20px; }
+
+  /* SEARCH */
+  .search-wrap { position: relative; margin-bottom: 24px; }
+  .search-input {
+    width: 100%; background: var(--surface); border: 1.5px solid var(--border);
+    border-radius: var(--radius); padding: 14px 52px 14px 18px;
+    color: var(--text); font-size: 16px; font-family: 'DM Mono', monospace;
+    outline: none; transition: border-color 0.2s;
+  }
+  .search-input:focus { border-color: var(--accent); }
+  .search-input::placeholder { color: var(--muted); }
+  .search-btn {
+    position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
+    background: var(--accent); border: none; border-radius: 10px;
+    width: 38px; height: 38px; cursor: pointer; display: flex; align-items: center; justify-content: center;
+    transition: opacity 0.2s;
+  }
+  .search-btn:hover { opacity: 0.85; }
+  .search-btn svg { width: 18px; height: 18px; }
+
+  /* WORD CARD */
+  .word-result {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); overflow: hidden; animation: slideUp 0.35s ease;
+  }
+  @keyframes slideUp { from { opacity:0; transform:translateY(16px); } to { opacity:1; transform:translateY(0); } }
+
+  .word-header { padding: 20px; border-bottom: 1px solid var(--border); }
+  .word-en { font-family: 'DM Serif Display', serif; font-size: 32px; color: var(--text); }
+  .word-pos {
+    display: inline-block; margin-top: 6px;
+    background: rgba(232,197,71,0.15); color: var(--accent);
+    font-size: 12px; font-family: 'DM Mono', monospace;
+    padding: 3px 10px; border-radius: 20px;
+  }
+  .word-body { padding: 20px; display: flex; flex-direction: column; gap: 16px; }
+
+  .section-label {
+    font-size: 10px; text-transform: uppercase; letter-spacing: 1.5px;
+    color: var(--muted); margin-bottom: 6px; font-family: 'DM Mono', monospace;
+  }
+  .definitions { list-style: none; display: flex; flex-direction: column; gap: 6px; }
+  .definitions li { font-size: 15px; line-height: 1.5; }
+  .definitions li::before { content: "·"; color: var(--accent); margin-right: 8px; }
+
+  .example-en { font-style: italic; color: var(--text); font-size: 14px; line-height: 1.6; }
+  .example-zh { color: var(--muted); font-size: 13px; margin-top: 4px; }
+
+  .roots { display: flex; flex-wrap: wrap; gap: 8px; }
+  .root-tag {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 10px; padding: 6px 12px;
+    font-size: 13px; font-family: 'DM Mono', monospace;
+  }
+  .root-tag span { color: var(--accent); }
+
+  .related { display: flex; flex-wrap: wrap; gap: 8px; }
+  .related-tag {
+    background: rgba(74,158,255,0.1); color: var(--accent2);
+    border: 1px solid rgba(74,158,255,0.2);
+    border-radius: 8px; padding: 5px 12px; font-size: 13px;
+    cursor: pointer; transition: background 0.2s;
+  }
+  .related-tag:hover { background: rgba(74,158,255,0.2); }
+
+  .save-btn {
+    width: 100%; margin: 4px 0; padding: 14px;
+    background: var(--accent); color: #000;
+    border: none; border-radius: 12px; font-size: 15px; font-weight: 500;
+    cursor: pointer; font-family: 'DM Sans', sans-serif;
+    transition: opacity 0.2s;
+  }
+  .save-btn:hover { opacity: 0.85; }
+  .save-btn.saved { background: var(--success); color: #fff; }
+
+  /* WORD LIST */
+  .word-list { display: flex; flex-direction: column; gap: 10px; }
+  .word-item {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 14px; padding: 16px 18px;
+    display: flex; align-items: center; justify-content: space-between;
+    cursor: pointer; transition: border-color 0.2s;
+  }
+  .word-item:hover { border-color: var(--accent); }
+  .word-item-left {}
+  .word-item-en { font-family: 'DM Serif Display', serif; font-size: 20px; }
+  .word-item-zh { font-size: 13px; color: var(--muted); margin-top: 2px; }
+  .word-item-right { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+  .level-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--muted);
+  }
+  .level-dot.l1 { background: #e05c5c; }
+  .level-dot.l2 { background: #e09e5c; }
+  .level-dot.l3 { background: var(--accent); }
+  .level-dot.l4 { background: #7ec8a0; }
+  .level-dot.l5 { background: var(--success); }
+  .due-badge {
+    font-size: 10px; font-family: 'DM Mono', monospace;
+    color: var(--accent); background: rgba(232,197,71,0.1);
+    padding: 2px 7px; border-radius: 6px;
+  }
+
+  /* FLASHCARD */
+  .flashcard-wrap {
+    perspective: 1200px; height: 320px; cursor: pointer;
+    margin-bottom: 24px;
+  }
+  .flashcard-inner {
+    position: relative; width: 100%; height: 100%;
+    transform-style: preserve-3d;
+    transition: transform 0.55s cubic-bezier(0.45, 0, 0.55, 1);
+  }
+  .flashcard-inner.flipped { transform: rotateY(180deg); }
+  .flashcard-face {
+    position: absolute; inset: 0;
+    backface-visibility: hidden;
+    border-radius: 20px; border: 1px solid var(--border);
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    padding: 32px; text-align: center;
+  }
+  .flashcard-front { background: var(--surface); }
+  .flashcard-back { background: var(--card); transform: rotateY(180deg); }
+  .fc-word { font-family: 'DM Serif Display', serif; font-size: 40px; margin-bottom: 8px; }
+  .fc-pos { color: var(--accent); font-family: 'DM Mono', monospace; font-size: 13px; margin-bottom: 4px; }
+  .fc-hint { color: var(--muted); font-size: 12px; margin-top: 16px; }
+  .fc-defs { font-size: 18px; line-height: 1.6; margin-bottom: 12px; }
+  .fc-example { font-style: italic; font-size: 13px; color: var(--muted); line-height: 1.5; }
+
+  .fc-actions { display: flex; gap: 12px; }
+  .fc-btn {
+    flex: 1; padding: 14px; border: none; border-radius: 14px;
+    font-size: 15px; font-weight: 500; cursor: pointer;
+    font-family: 'DM Sans', sans-serif; transition: opacity 0.2s;
+  }
+  .fc-btn:hover { opacity: 0.85; }
+  .fc-btn.wrong { background: rgba(224,92,92,0.2); color: var(--danger); }
+  .fc-btn.right { background: rgba(92,184,122,0.2); color: var(--success); }
+
+  .fc-progress { text-align: center; color: var(--muted); font-size: 13px; margin-bottom: 16px; font-family: 'DM Mono', monospace; }
+  .fc-nav { display: flex; gap: 10px; margin-bottom: 16px; }
+  .fc-nav-btn {
+    flex: 1; padding: 12px; background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; color: var(--text); font-size: 14px; cursor: pointer;
+    font-family: 'DM Sans', sans-serif; transition: border-color 0.2s;
+  }
+  .fc-nav-btn:hover { border-color: var(--accent); }
+
+  /* SPELLING */
+  .spell-word-display {
+    text-align: center; margin-bottom: 24px;
+  }
+  .spell-hint { font-size: 13px; color: var(--muted); margin-bottom: 8px; font-family: 'DM Mono', monospace; }
+  .spell-definition { font-size: 16px; line-height: 1.6; }
+  .spell-example { font-style: italic; font-size: 14px; color: var(--muted); margin-top: 8px; }
+
+  .letter-boxes { display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; margin-bottom: 24px; }
+  .letter-box {
+    width: 42px; height: 50px; border-radius: 10px;
+    border: 1.5px solid var(--border); background: var(--surface);
+    display: flex; align-items: center; justify-content: center;
+    font-family: 'DM Mono', monospace; font-size: 20px; font-weight: 500;
+    transition: border-color 0.2s, background 0.2s;
+  }
+  .letter-box.filled { border-color: var(--accent); }
+  .letter-box.correct { border-color: var(--success); background: rgba(92,184,122,0.1); color: var(--success); }
+  .letter-box.wrong { border-color: var(--danger); background: rgba(224,92,92,0.1); color: var(--danger); }
+
+  .keyboard { display: flex; flex-direction: column; gap: 6px; }
+  .key-row { display: flex; gap: 5px; justify-content: center; }
+  .key {
+    min-width: 32px; height: 44px; border-radius: 8px;
+    background: var(--surface); border: 1px solid var(--border);
+    color: var(--text); font-size: 15px; font-family: 'DM Mono', monospace;
+    cursor: pointer; transition: background 0.15s;
+    display: flex; align-items: center; justify-content: center; padding: 0 8px;
+  }
+  .key:hover { background: var(--card); }
+  .key.wide { min-width: 56px; font-size: 12px; }
+  .key:disabled { opacity: 0.3; cursor: default; }
+
+  /* DAILY */
+  .daily-header {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 20px; margin-bottom: 20px;
+    display: flex; align-items: center; gap: 16px;
+  }
+  .daily-icon { font-size: 36px; }
+  .daily-count { font-family: 'DM Serif Display', serif; font-size: 28px; }
+  .daily-label { font-size: 13px; color: var(--muted); }
+
+  /* LOADING / EMPTY */
+  .loading {
+    display: flex; flex-direction: column; align-items: center;
+    padding: 48px 20px; color: var(--muted); gap: 12px;
+  }
+  .spinner {
+    width: 32px; height: 32px; border: 2px solid var(--border);
+    border-top-color: var(--accent); border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .empty { text-align: center; padding: 48px 20px; color: var(--muted); }
+  .empty-icon { font-size: 48px; margin-bottom: 12px; }
+
+  .session-done {
+    text-align: center; padding: 48px 20px; animation: slideUp 0.3s ease;
+  }
+  .session-done h2 { font-family: 'DM Serif Display', serif; font-size: 28px; margin-bottom: 8px; }
+  .session-done p { color: var(--muted); font-size: 14px; }
+  .done-icon { font-size: 64px; margin-bottom: 16px; }
+
+  .mode-toggle {
+    display: flex; gap: 8px; margin-bottom: 20px;
+  }
+  .mode-btn {
+    flex: 1; padding: 10px; border-radius: 10px;
+    background: var(--surface); border: 1px solid var(--border);
+    color: var(--muted); font-size: 13px; cursor: pointer;
+    font-family: 'DM Sans', sans-serif; transition: all 0.2s;
+  }
+  .mode-btn.active { background: var(--accent); color: #000; border-color: var(--accent); font-weight: 500; }
+
+  .progress-bar-wrap { height: 4px; background: var(--border); border-radius: 2px; margin-bottom: 20px; }
+  .progress-bar { height: 100%; border-radius: 2px; background: var(--accent); transition: width 0.3s; }
+
+  .delete-btn {
+    background: none; border: none; color: var(--muted); cursor: pointer;
+    font-size: 18px; padding: 4px; transition: color 0.2s;
+  }
+  .delete-btn:hover { color: var(--danger); }
+
+  .section-title {
+    font-family: 'DM Serif Display', serif; font-size: 22px; margin-bottom: 16px;
+  }
+`;
+
+// ── Tab Icons ──────────────────────────────────────────────────────────────
+const icons = {
+  search: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>,
+  cards: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="4" width="20" height="16" rx="3"/><path d="M8 4v16M16 4v16"/></svg>,
+  spell: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="4 7 4 4 20 4 20 7"/><line x1="9" y1="20" x2="15" y2="20"/><line x1="12" y1="4" x2="12" y2="20"/></svg>,
+  fill: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="6" x2="12" y2="6"/><line x1="4" y1="18" x2="16" y2="18"/></svg>,
+  daily: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>,
+  list: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>,
+};
+
+// ── Notion seed data (injected by Claude) ─────────────────────────────────
+const NOTION_SEED = [{"id":"insipid-001","notionId":null,"word":"insipid","pos":"adj.","definitions":["無味的；淡而無味的（食物）；乏味的；無聊的","平淡無奇的；缺乏特色的；令人提不起興趣的"],"examples":[{"sentence":"The film's insipid script failed to make use of its talented cast, leaving audiences bored and indifferent.","translation":"這部電影乏味的劇本未能善用其才華洋溢的卡司，令觀眾感到無聊和漠然。","source":"The Guardian"},{"sentence":"Critics dismissed the redesign as insipid, arguing that stripping away all bold choices had produced something forgettable.","translation":"批評者斥責這次重新設計毫無生氣，認為摒棄所有大膽選擇的結果只是一個令人遺忘的作品。","source":"Wall Street Journal"},{"sentence":"Voters grew weary of insipid campaign promises that offered no concrete vision for the country's future.","translation":"選民對那些缺乏具體願景的平淡競選承諾感到厭倦。","source":"The Economist"}],"roots":[{"root":"in-","meaning":"否定前綴，表示「不」"},{"root":"sapidus","meaning":"拉丁文，意為「有味道的、美味的」，源自 sapere（有味道；有智慧）"}],"related":["vapid","bland","jejune","banal","inane"],"level":0,"nextReview":0,"addedAt":1746100000000},{"id":"3536141b-7a5f-81f5-927d-fa73e99ac682","notionId":"3536141b-7a5f-81f5-927d-fa73e99ac682","word":"Effervescence","pos":"n.","definitions":["氣泡；冒泡現象（液體中氣泡湧現的狀態）","活力；熱情洋溢；生氣勃勃的特質"],"examples":[{"sentence":"The effervescence of the new administration's first hundred days gave way to the grinding reality of governance.","translation":"新政府執政百日初期的活力與朝氣，逐漸被施政治理的艱難現實所取代。","source":"The Economist"},{"sentence":"Scientists studying the effervescence of carbonated water found that the size and frequency of bubbles are determined by microscopic imperfections on the glass surface.","translation":"研究碳酸水冒泡現象的科學家發現，氣泡的大小與頻率取決於玻璃表面的微觀瑕疵。","source":"Scientific American"},{"sentence":"The cultural effervescence of 1920s Paris attracted writers, painters, and musicians from across the world.","translation":"1920年代巴黎文化上的蓬勃生機吸引了來自世界各地的作家、畫家與音樂家。","source":"The New York Times"}],"roots":[{"root":"ex-","meaning":"向外"},{"root":"fervere","meaning":"沸騰；翻滾（拉丁文）"},{"root":"-escence","meaning":"表示過程或狀態的名詞後綴"}],"related":["effervescent","ebullience","vivacity","sparkle","exuberance"],"level":0,"nextReview":0,"addedAt":1746093000000},{"id":"3536141b-7a5f-815b-85a3-df68a54055b9","notionId":"3536141b-7a5f-815b-85a3-df68a54055b9","word":"insidious","pos":"adj.","definitions":["暗中為害的；潛伏的；隱伏的（指危險或疾病在不知不覺中逐漸惡化）","狡猾的；陰險的；居心叵測的"],"examples":[{"sentence":"The insidious spread of misinformation on social media has quietly eroded public trust in democratic institutions.","translation":"錯誤資訊在社群媒體上的潛伏式蔓延，已悄然侵蝕了公眾對民主機構的信任。","source":"The Economist"},{"sentence":"Researchers warn that the insidious effects of microplastics on the human endocrine system may not manifest for decades.","translation":"研究人員警告，微塑膠對人體內分泌系統的潛在危害可能數十年後才會顯現。","source":"Scientific American"},{"sentence":"Corporate greenwashing is particularly insidious because it exploits consumers genuine desire to make ethical choices.","translation":"企業的漂綠行為尤為陰險，因為它利用了消費者真誠希望做出合乎道德選擇的心理。","source":"Financial Times"}],"roots":[{"root":"insidi-","meaning":"源自拉丁文 insidiae，意為埋伏、圈套、陷阱"},{"root":"-ous","meaning":"形容詞後綴，表示具有性質的"}],"related":["pernicious","sinister","subtle","treacherous","malevolent"],"level":0,"nextReview":0,"addedAt":1746093000000},{"id":"3536141b-7a5f-81ed-bd64-f5d8af9c6d5e","notionId":"3536141b-7a5f-81ed-bd64-f5d8af9c6d5e","word":"cohort","pos":"n.","definitions":["（統計、研究中的）同期群；具有共同特徵的一組人","（古羅馬軍隊的）大隊；夥伴，同僚"],"examples":[{"sentence":"The study tracked a cohort of 10,000 adults over two decades to examine the long-term effects of diet on cardiovascular health.","translation":"這項研究追蹤了一組10,000名成年人長達二十年，以檢視飲食對心血管健康的長期影響。","source":"The Lancet"},{"sentence":"Economists warn that the cohort of workers who entered the labour market during the 2008 financial crisis still earns less than peers who graduated in more prosperous times.","translation":"經濟學家警告，在2008年金融危機期間進入勞動市場的那批工作者，收入至今仍低於在較繁榮時期畢業的同齡人。","source":"The Economist"},{"sentence":"The tech giants latest layoffs have hit the cohort of mid-level managers hardest.","translation":"這家科技巨頭最新一輪裁員對中層管理人員這個群體打擊最大。","source":"Financial Times"}],"roots":[{"root":"cohors","meaning":"拉丁語，圍場、圍欄；引申為一群人或軍隊分隊"}],"related":["peer group","demographic","generation","contingent","cadre"],"level":0,"nextReview":0,"addedAt":1746093000000},{"id":"3536141b-7a5f-81e9-a5a5-ee978d959966","notionId":"3536141b-7a5f-81e9-a5a5-ee978d959966","word":"imperishable","pos":"adj.","definitions":["不朽的；永恆的；不會腐爛或消亡的","經久不衰的；歷久彌新的"],"examples":[{"sentence":"The composers imperishable melodies have endured for centuries, still filling concert halls around the world with audiences moved to tears.","translation":"這位作曲家不朽的旋律歷經幾個世紀仍長盛不衰，至今依然令全球音樂廳裡的聽眾動容落淚。","source":"The Economist"},{"sentence":"Certain philosophical texts from ancient Greece are considered imperishable contributions to human thought.","translation":"古希臘某些哲學典籍被視為人類思想中不朽的貢獻。","source":"The New York Review of Books"},{"sentence":"The brand has built an imperishable reputation over decades, surviving economic downturns and shifting consumer tastes.","translation":"這個品牌歷經數十年建立起經久不衰的聲譽，在多次經濟衰退和消費者品味更迭中屹立不搖。","source":"Financial Times"}],"roots":[{"root":"im-","meaning":"否定前綴，表示非或不"},{"root":"perish","meaning":"源自拉丁語 perire，消亡、腐爛、死去"},{"root":"-able","meaning":"後綴，表示能夠的"}],"related":["everlasting","eternal","indestructible","enduring","undying"],"level":0,"nextReview":0,"addedAt":1746093000000},{"id":"3536141b-7a5f-8118-9ccd-dd1e17894bde","notionId":"3536141b-7a5f-8118-9ccd-dd1e17894bde","word":"copious","pos":"adj.","definitions":["大量的；豐富的","（文字或內容）詳盡的；冗長的"],"examples":[{"sentence":"The defence team took copious notes during the three-week trial, filling dozens of legal pads with witness testimony.","translation":"辯護團隊在長達三週的審判過程中做了大量筆記，用數十本法律便條本記錄了證人證詞。","source":"The New York Times"},{"sentence":"Researchers found copious evidence of microplastic contamination in deep-sea sediment samples collected from the Mariana Trench.","translation":"研究人員在從馬里亞納海溝採集的深海沉積物樣本中發現了大量微塑膠污染的證據。","source":"Nature"},{"sentence":"The central banks decision to inject copious liquidity into the financial system helped stabilise markets but raised long-term inflation concerns.","translation":"央行向金融體系注入大量流動性的決定有助於穩定市場，但也引發了對長期通膨的擔憂。","source":"Financial Times"}],"roots":[{"root":"copi-","meaning":"源自拉丁文 copia，意為豐富、充裕"},{"root":"-ous","meaning":"形容詞後綴，表示具有性質的"}],"related":["abundant","plentiful","prolific","profuse","ample"],"level":0,"nextReview":0,"addedAt":1746093000000}];
+
+const LOCAL_KEY = "worddeck_v3";
+
+function loadLocal() {
+  try { return JSON.parse(localStorage.getItem(LOCAL_KEY)) || null; } catch { return null; }
+}
+function saveLocal(w) {
+  try { localStorage.setItem(LOCAL_KEY, JSON.stringify(w)); } catch {}
+}
+
+// ── Main App ───────────────────────────────────────────────────────────────
+function App() {
+  const [tab, setTab] = useState("search");
+  const [syncMsg, setSyncMsg] = useState("");
+
+  // Merge seed with local progress (level, nextReview)
+  const [words, setWords] = useState(() => {
+    const local = loadLocal();
+    if (local && local.length > 0) return local;
+    return NOTION_SEED;
+  });
+
+  const persistWords = (w) => { setWords(w); saveLocal(w); };
+
+  const addWord = async (wordData) => {
+    if (words.find(w => w.word.toLowerCase() === wordData.word.toLowerCase())) return false;
+    setSyncMsg("⏳ 存入 Notion...");
+    const notionId = await addToNotion(wordData).catch(() => null);
+    const newWord = { ...wordData, id: notionId || Date.now(), notionId, level: 0, nextReview: nextReview(0), addedAt: Date.now() };
+    persistWords([newWord, ...words]);
+    setSyncMsg("✓ 已同步");
+    setTimeout(() => setSyncMsg(""), 2000);
+    return true;
+  };
+
+  const updateWord = (id, updates) => {
+    const updated = words.map(w => w.id === id ? { ...w, ...updates } : w);
+    persistWords(updated);
+    const word = words.find(w => w.id === id);
+    if (word?.notionId && updates.level !== undefined) {
+      updateInNotion(word.notionId, updates.level).catch(() => {});
+    }
+  };
+
+  const deleteWord = (id) => {
+    const word = words.find(w => w.id === id);
+    persistWords(words.filter(w => w.id !== id));
+    if (word?.notionId) deleteFromNotion(word.notionId).catch(() => {});
+  };
+
+  const dueWords = words.filter(isDueToday);
+
+  return (
+    <>
+      <style>{style}</style>
+      <div className="app">
+        <div className="nav">
+          <span className="nav-title">WordDeck</span>
+          {syncMsg ? <span className="nav-badge">{syncMsg}</span> : dueWords.length > 0 && <span className="nav-badge">📅 {dueWords.length} due today</span>}
+        </div>
+
+        {tab === "search" && <SearchPage words={words} addWord={addWord} />}
+        {tab === "cards" && <FlashcardPage words={words} updateWord={updateWord} />}
+        {tab === "spell" && <SpellingPage words={words} updateWord={updateWord} />}
+        {tab === "fill" && <FillPage words={words} updateWord={updateWord} />}
+        {tab === "daily" && <DailyPage words={dueWords} updateWord={updateWord} />}
+        {tab === "list" && <ListPage words={words} deleteWord={deleteWord} />}
+
+        <div className="tabs">
+          {[
+            { id: "search", label: "查單字", icon: icons.search },
+            { id: "cards", label: "翻轉卡", icon: icons.cards },
+            { id: "spell", label: "拼字", icon: icons.spell },
+            { id: "fill", label: "填字", icon: icons.fill },
+            { id: "daily", label: "每日", icon: icons.daily },
+            { id: "list", label: "單字表", icon: icons.list },
+          ].map(t => (
+            <button key={t.id} className={`tab${tab === t.id ? " active" : ""}`} onClick={() => setTab(t.id)}>
+              {t.icon}{t.label}
+            </button>
+          ))}
+        </div>
+      </div>
+    </>
+  );
+}
+
+// ── Search Page ────────────────────────────────────────────────────────────
+function SearchPage({ words, addWord }) {
+  const [query, setQuery] = useState("");
+  const [result, setResult] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [saved, setSaved] = useState(false);
+
+  const search = async (w) => {
+    const term = (w || query).trim();
+    if (!term) return;
+    setLoading(true); setError(""); setResult(null); setSaved(false);
+    try {
+      const data = await lookupWord(term);
+      setResult(data);
+    } catch {
+      setError("查詢失敗，請再試一次");
+    }
+    setLoading(false);
+  };
+
+  const handleSave = async () => {
+    if (!result) return;
+    const ok = await addWord(result);
+    if (ok) setSaved(true);
+  };
+
+  const alreadySaved = result && words.some(w => w.word.toLowerCase() === result.word.toLowerCase());
+
+  return (
+    <div className="page">
+      <div className="search-wrap">
+        <input
+          className="search-input"
+          placeholder="輸入英文單字..."
+          value={query}
+          onChange={e => setQuery(e.target.value)}
+          onKeyDown={e => e.key === "Enter" && search()}
+        />
+        <button className="search-btn" onClick={() => search()}>
+          <svg viewBox="0 0 24 24" fill="none" stroke="#000" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+        </button>
+      </div>
+
+      {loading && <div className="loading"><div className="spinner"/><span>查詢中...</span></div>}
+      {error && <div className="empty"><div className="empty-icon">⚠️</div><p>{error}</p></div>}
+
+      {result && (
+        <div className="word-result">
+          <div className="word-header">
+            <div style={{display:"flex", alignItems:"center", gap:12}}>
+              <div className="word-en">{result.word}</div>
+              <SpeakBtn text={result.word} />
+            </div>
+            <div className="word-pos">{result.pos}</div>
+          </div>
+          <div className="word-body">
+            <div>
+              <div className="section-label">字義</div>
+              <ul className="definitions">{result.definitions.map((d, i) => <li key={i}>{d}</li>)}</ul>
+            </div>
+            <div>
+              <div className="section-label">例句</div>
+              {(result.examples || (result.example ? [{sentence: result.example, translation: result.exampleTranslation, source: ""}] : [])).map((ex, i) => (
+                <div key={i} style={{marginBottom: i < (result.examples?.length - 1) ? 14 : 0}}>
+                  {ex.source && <div style={{fontSize:10, color:"var(--accent2)", fontFamily:"'DM Mono',monospace", marginBottom:4, textTransform:"uppercase", letterSpacing:"1px"}}>📰 {ex.source}</div>}
+                  <div className="example-en">"{ex.sentence}"</div>
+                  <div className="example-zh">{ex.translation}</div>
+                </div>
+              ))}
+            </div>
+            {result.roots?.length > 0 && (
+              <div>
+                <div className="section-label">字根字詞</div>
+                <div className="roots">
+                  {result.roots.map((r, i) => (
+                    <div key={i} className="root-tag"><span>{r.root}</span> {r.meaning}</div>
+                  ))}
+                </div>
+              </div>
+            )}
+            {result.related?.length > 0 && (
+              <div>
+                <div className="section-label">相關單字</div>
+                <div className="related">
+                  {result.related.map((r, i) => (
+                    <span key={i} className="related-tag" onClick={() => { setQuery(r); search(r); }}>{r}</span>
+                  ))}
+                </div>
+              </div>
+            )}
+            <button
+              className={`save-btn${saved || alreadySaved ? " saved" : ""}`}
+              onClick={handleSave}
+              disabled={saved || alreadySaved}
+            >
+              {saved || alreadySaved ? "✓ 已加入並同步 Notion" : "+ 加入單字表"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {!result && !loading && !error && (
+        <div className="empty">
+          <div className="empty-icon">✦</div>
+          <p>輸入單字開始查詢</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Flashcard Page ─────────────────────────────────────────────────────────
+function FlashcardPage({ words, updateWord }) {
+  const [index, setIndex] = useState(0);
+  const [flipped, setFlipped] = useState(false);
+  const [mode, setMode] = useState("all"); // all | due
+  const exRef = useRef(null);
+
+  const pool = mode === "due" ? words.filter(isDueToday) : words;
+
+  if (pool.length === 0) return (
+    <div className="page">
+      <div className="mode-toggle">
+        <button className={`mode-btn${mode==="all"?" active":""}`} onClick={() => setMode("all")}>全部單字</button>
+        <button className={`mode-btn${mode==="due"?" active":""}`} onClick={() => setMode("due")}>今日複習</button>
+      </div>
+      <div className="empty"><div className="empty-icon">🃏</div><p>{mode==="due" ? "今天沒有要複習的單字" : "還沒有單字，先去查一個吧！"}</p></div>
+    </div>
+  );
+
+  const w = pool[index % pool.length];
+  if (!exRef.current || exRef.current.id !== w.id) exRef.current = { id: w.id, ex: randEx(w) };
+  const curEx = exRef.current.ex;
+
+  const next = () => { exRef.current = null; setFlipped(false); setTimeout(() => setIndex(i => (i + 1) % pool.length), 50); };
+  const prev = () => { exRef.current = null; setFlipped(false); setTimeout(() => setIndex(i => (i - 1 + pool.length) % pool.length), 50); };
+
+  const mark = (correct) => {
+    const newLevel = correct ? Math.min(w.level + 1, 5) : Math.max(w.level - 1, 0);
+    updateWord(w.id, { level: newLevel, nextReview: nextReview(newLevel) });
+    next();
+  };
+
+  return (
+    <div className="page">
+      <div className="mode-toggle">
+        <button className={`mode-btn${mode==="all"?" active":""}`} onClick={() => { setMode("all"); setIndex(0); setFlipped(false); }}>全部單字</button>
+        <button className={`mode-btn${mode==="due"?" active":""}`} onClick={() => { setMode("due"); setIndex(0); setFlipped(false); }}>今日複習</button>
+      </div>
+      <div className="fc-progress">{(index % pool.length) + 1} / {pool.length}</div>
+      <div className="progress-bar-wrap"><div className="progress-bar" style={{width:`${((index%pool.length)+1)/pool.length*100}%`}}/></div>
+
+      <div className="flashcard-wrap" onClick={() => setFlipped(f => !f)}>
+        <div className={`flashcard-inner${flipped ? " flipped" : ""}`}>
+          <div className="flashcard-face flashcard-front">
+            <div className="fc-word">{w.word}</div>
+            <div className="fc-pos">{w.pos}</div>
+            <SpeakBtn text={w.word} style={{marginTop:8}} />
+            <div className="fc-example" style={{marginTop:12, fontSize:13}}>{curEx.sentence}</div>
+            <div className="fc-hint" style={{marginTop:12}}>點擊翻轉</div>
+          </div>
+          <div className="flashcard-face flashcard-back">
+            <div className="fc-word">{w.word}</div>
+            <div className="fc-pos" style={{marginBottom:12}}>{w.pos}</div>
+            <div className="fc-defs">{w.definitions?.join("；")}</div>
+            <div className="fc-example" style={{marginTop:8}}>"{curEx.sentence}"</div>
+          </div>
+        </div>
+      </div>
+
+      {flipped ? (
+        <div className="fc-actions">
+          <button className="fc-btn wrong" onClick={() => mark(false)}>✗ 不熟</button>
+          <button className="fc-btn right" onClick={() => mark(true)}>✓ 認識</button>
+        </div>
+      ) : (
+        <div className="fc-nav">
+          <button className="fc-nav-btn" onClick={prev}>← 上一個</button>
+          <button className="fc-nav-btn" onClick={next}>下一個 →</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Spelling Page ──────────────────────────────────────────────────────────
+const KEYBOARD = [["q","w","e","r","t","y","u","i","o","p"],["a","s","d","f","g","h","j","k","l"],["⌫","z","x","c","v","b","n","m","✓"]];
+const isMobile = () => /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || window.matchMedia("(pointer: coarse)").matches;
+
+function SpellingPage({ words, updateWord }) {
+  const [index, setIndex] = useState(0);
+  const [input, setInput] = useState([]);
+  const [status, setStatus] = useState(null);
+  const [mode, setMode] = useState("all");
+  const mobile = isMobile();
+
+  const pool = mode === "due" ? words.filter(isDueToday) : words;
+
+  if (pool.length === 0) return (
+    <div className="page">
+      <div className="mode-toggle">
+        <button className={`mode-btn${mode==="all"?" active":""}`} onClick={() => setMode("all")}>全部單字</button>
+        <button className={`mode-btn${mode==="due"?" active":""}`} onClick={() => setMode("due")}>今日複習</button>
+      </div>
+      <div className="empty"><div className="empty-icon">✍️</div><p>{mode==="due" ? "今天沒有要複習的單字" : "還沒有單字，先去查一個吧！"}</p></div>
+    </div>
+  );
+
+  const w = pool[index % pool.length];
+  const target = w.word.toLowerCase();
+
+  const press = (k) => {
+    if (status) return;
+    if (k === "⌫") { setInput(i => i.slice(0, -1)); return; }
+    if (k === "✓") { check(); return; }
+    if (/^[a-z]$/.test(k) && input.length < target.length) setInput(i => [...i, k]);
+  };
+
+  const check = () => {
+    if (input.length !== target.length) return;
+    const correct = input.join("") === target;
+    setStatus(correct ? "correct" : "wrong");
+    if (correct) updateWord(w.id, { level: Math.min(w.level+1,5), nextReview: nextReview(Math.min(w.level+1,5)) });
+  };
+
+  const next = () => { setInput([]); setStatus(null); setIndex(i => (i+1) % pool.length); };
+
+  const inputRef = useRef(input);
+  const statusRef = useRef(status);
+  const targetRef = useRef(target);
+  useEffect(() => { inputRef.current = input; }, [input]);
+  useEffect(() => { statusRef.current = status; }, [status]);
+  useEffect(() => { targetRef.current = target; }, [target]);
+
+  useEffect(() => {
+    if (mobile) return;
+    const handler = (e) => {
+      const curStatus = statusRef.current;
+      const curTarget = targetRef.current;
+      if (curStatus) {
+        if (e.key === "Enter") { setInput([]); setStatus(null); setIndex(i => (i+1) % pool.length); }
+        return;
+      }
+      if (e.key === "Backspace") { e.preventDefault(); setInput(i => i.slice(0,-1)); return; }
+      if (e.key === "Enter") {
+        setInput(cur => {
+          if (cur.length !== curTarget.length) return cur;
+          const correct = cur.join("") === curTarget;
+          setStatus(correct ? "correct" : "wrong");
+          if (correct) updateWord(w.id, { level: Math.min(w.level+1,5), nextReview: nextReview(Math.min(w.level+1,5)) });
+          return cur;
+        });
+        return;
+      }
+      if (/^[a-zA-Z]$/.test(e.key)) {
+        setInput(cur => cur.length < curTarget.length ? [...cur, e.key.toLowerCase()] : cur);
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [mobile, w.id, w.level]);
+
+  useEffect(() => { setInput([]); setStatus(null); }, [index]);
+
+  return (
+    <div className="page">
+      <div className="mode-toggle">
+        <button className={`mode-btn${mode==="all"?" active":""}`} onClick={() => { setMode("all"); setIndex(0); }}>全部單字</button>
+        <button className={`mode-btn${mode==="due"?" active":""}`} onClick={() => { setMode("due"); setIndex(0); }}>今日複習</button>
+      </div>
+      <div className="fc-progress">{(index % pool.length) + 1} / {pool.length}</div>
+      <div className="progress-bar-wrap"><div className="progress-bar" style={{width:`${((index%pool.length)+1)/pool.length*100}%`}}/></div>
+
+      <div className="spell-word-display">
+        <div className="spell-hint">{mobile ? "拼出這個單字" : "拼出這個單字（直接用鍵盤打，Enter 確認）"}</div>
+        <div className="spell-definition">{w.definitions?.[0]}</div>
+        <div className="spell-example">"{randEx(w).sentence}"</div>
+      </div>
+
+      <div className="letter-boxes">
+        {Array.from({ length: target.length }).map((_, i) => {
+          const letter = status ? target[i] : input[i] || "";
+          let cls = "letter-box";
+          if (status === "correct") cls += " correct";
+          else if (status === "wrong") cls += input[i] === target[i] ? " correct" : " wrong";
+          else if (input[i]) cls += " filled";
+          return <div key={i} className={cls}>{letter.toUpperCase()}</div>;
+        })}
+      </div>
+
+      {status ? (
+        <div style={{textAlign:"center",marginBottom:16}}>
+          <div style={{fontSize:24,marginBottom:8}}>{status==="correct"?"🎉 正確！":"😅 再試試"}</div>
+          {status==="wrong"&&<div style={{color:"var(--muted)",marginBottom:12}}>正確答案：{target.toUpperCase()}</div>}
+          <button className="save-btn" onClick={next}>下一個 → {!mobile && <span style={{fontSize:12,opacity:0.6}}>(Enter)</span>}</button>
+        </div>
+      ) : mobile ? (
+        <div className="keyboard">
+          {KEYBOARD.map((row, ri) => (
+            <div key={ri} className="key-row">
+              {row.map(k => <button key={k} className={`key${k.length>1?" wide":""}`} onClick={() => press(k)}>{k}</button>)}
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div style={{textAlign:"center", color:"var(--muted)", fontSize:13, padding:"20px 0", fontFamily:"'DM Mono',monospace"}}>
+          ⌨️ 直接用鍵盤輸入
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Daily Page ─────────────────────────────────────────────────────────────
+function DailyPage({ words: dueWords, updateWord }) {
+  const [mode, setMode] = useState("flash"); // flash | spell
+  const [index, setIndex] = useState(0);
+  const [flipped, setFlipped] = useState(false);
+  const [done, setDone] = useState(false);
+
+  if (dueWords.length === 0 || done) return (
+    <div className="page">
+      <div className="session-done">
+        <div className="done-icon">🌟</div>
+        <h2>今日完成！</h2>
+        <p style={{marginTop:8}}>明天繼續保持！</p>
+      </div>
+    </div>
+  );
+
+  const w = dueWords[index];
+
+  const mark = (correct) => {
+    const newLevel = correct ? Math.min(w.level + 1, 5) : Math.max(w.level - 1, 0);
+    updateWord(w.id, { level: newLevel, nextReview: nextReview(newLevel) });
+    setFlipped(false);
+    if (index + 1 >= dueWords.length) setDone(true);
+    else setTimeout(() => setIndex(i => i + 1), 50);
+  };
+
+  return (
+    <div className="page">
+      <div className="daily-header">
+        <div className="daily-icon">📅</div>
+        <div>
+          <div className="daily-count">{dueWords.length - index} 個單字</div>
+          <div className="daily-label">今日待複習</div>
+        </div>
+      </div>
+      <div className="mode-toggle" style={{marginBottom:16}}>
+        <button className={`mode-btn${mode==="flash"?" active":""}`} onClick={() => { setMode("flash"); setFlipped(false); }}>翻轉卡片</button>
+        <button className={`mode-btn${mode==="spell"?" active":""}`} onClick={() => setMode("spell")}>拼字練習</button>
+      </div>
+      <div className="progress-bar-wrap"><div className="progress-bar" style={{width:`${(index/dueWords.length)*100}%`}}/></div>
+
+      {mode === "flash" ? (
+        <>
+          <div className="flashcard-wrap" onClick={() => setFlipped(f => !f)}>
+            <div className={`flashcard-inner${flipped ? " flipped" : ""}`}>
+              <div className="flashcard-face flashcard-front">
+                <div className="fc-word">{w.word}</div>
+                <div className="fc-pos">{w.pos}</div>
+                <SpeakBtn text={w.word} style={{marginTop:8}} />
+                <div className="fc-example" style={{marginTop:12, fontSize:13}}>{randEx(w).sentence}</div>
+                <div className="fc-hint" style={{marginTop:12}}>點擊翻轉</div>
+              </div>
+              <div className="flashcard-face flashcard-back">
+                <div className="fc-word">{w.word}</div>
+                <div className="fc-pos" style={{marginBottom:12}}>{w.pos}</div>
+                <div className="fc-defs">{w.definitions?.join("；")}</div>
+                <div className="fc-example" style={{marginTop:8}}>"{randEx(w).sentence}"</div>
+              </div>
+            </div>
+          </div>
+          {flipped ? (
+            <div className="fc-actions">
+              <button className="fc-btn wrong" onClick={() => mark(false)}>✗ 不熟</button>
+              <button className="fc-btn right" onClick={() => mark(true)}>✓ 認識</button>
+            </div>
+          ) : (
+            <div style={{textAlign:"center",color:"var(--muted)",fontSize:14}}>翻轉後評分</div>
+          )}
+        </>
+      ) : (
+        <DailySpelling w={w} onDone={mark} />
+      )}
+    </div>
+  );
+}
+
+function DailySpelling({ w, onDone }) {
+  const [input, setInput] = useState([]);
+  const [status, setStatus] = useState(null);
+  const target = w.word.toLowerCase();
+
+  useEffect(() => { setInput([]); setStatus(null); }, [w.id]);
+
+  const press = (k) => {
+    if (status) return;
+    if (k === "⌫") { setInput(i => i.slice(0, -1)); return; }
+    if (k === "✓") {
+      if (input.length !== target.length) return;
+      const correct = input.join("") === target;
+      setStatus(correct ? "correct" : "wrong");
+      return;
+    }
+    if (input.length < target.length) setInput(i => [...i, k]);
+  };
+
+  return (
+    <>
+      <div className="spell-word-display">
+        <div className="spell-definition">{w.definitions?.[0]}</div>
+        <div className="spell-example">"{w.example}"</div>
+      </div>
+      <div className="letter-boxes">
+        {Array.from({ length: target.length }).map((_, i) => {
+          const letter = status ? target[i] : input[i] || "";
+          let cls = "letter-box";
+          if (status === "correct") cls += " correct";
+          else if (status === "wrong") cls += input[i] === target[i] ? " correct" : " wrong";
+          else if (input[i]) cls += " filled";
+          return <div key={i} className={cls}>{letter.toUpperCase()}</div>;
+        })}
+      </div>
+      {status ? (
+        <div style={{textAlign:"center",marginBottom:16}}>
+          <div style={{fontSize:20,marginBottom:12}}>{status==="correct"?"🎉 正確！":"😅 " + target.toUpperCase()}</div>
+          <button className="save-btn" onClick={() => onDone(status==="correct")}>下一個 →</button>
+        </div>
+      ) : (
+        <div className="keyboard">
+          {KEYBOARD.map((row, ri) => (
+            <div key={ri} className="key-row">
+              {row.map(k => <button key={k} className={`key${k.length>1?" wide":""}`} onClick={() => press(k)}>{k}</button>)}
+            </div>
+          ))}
+        </div>
+      )}
+    </>
+  );
+}
+
+// ── Fill-in-the-Blank Page ─────────────────────────────────────────────────
+function FillPage({ words, updateWord }) {
+  const [index, setIndex] = useState(0);
+  const [input, setInput] = useState("");
+  const [status, setStatus] = useState(null); // null | correct | wrong
+  const [ex, setEx] = useState(null);
+  const inputRef = useRef(null);
+
+  const pool = words.length > 0 ? words : [];
+
+  const w = pool[index % Math.max(pool.length, 1)];
+
+  // Pick a random example when word changes
+  useEffect(() => {
+    if (w) setEx(randEx(w));
+    setInput("");
+    setStatus(null);
+    setTimeout(() => inputRef.current?.focus(), 100);
+  }, [index, w?.id]);
+
+  if (pool.length === 0) return (
+    <div className="page">
+      <div className="empty"><div className="empty-icon">✏️</div><p>還沒有單字，先去查一個吧！</p></div>
+    </div>
+  );
+
+  const target = w.word.toLowerCase();
+
+  const check = () => {
+    if (!input.trim()) return;
+    const correct = input.trim().toLowerCase() === target;
+    setStatus(correct ? "correct" : "wrong");
+    if (correct) updateWord(w.id, { level: Math.min(w.level+1,5), nextReview: nextReview(Math.min(w.level+1,5)) });
+  };
+
+  const next = () => {
+    setIndex(i => (i + 1) % pool.length);
+  };
+
+  // Build sentence with blank
+  const blank = "＿".repeat(Math.max(w.word.length, 3));
+  const re = new RegExp(w.word, "gi");
+  const sentence = ex?.sentence || "";
+  const parts = sentence.split(re);
+
+  const sentenceDisplay = status ? (
+    <span>
+      {parts.map((part, i) => (
+        <span key={i}>
+          {part}
+          {i < parts.length - 1 && (
+            <span style={{
+              color: status === "correct" ? "var(--success)" : "var(--danger)",
+              fontWeight: 600, fontStyle: "normal"
+            }}>{w.word}</span>
+          )}
+        </span>
+      ))}
+    </span>
+  ) : (
+    <span>
+      {parts.map((part, i) => (
+        <span key={i}>
+          {part}
+          {i < parts.length - 1 && (
+            <span style={{
+              borderBottom: "2px solid var(--accent)",
+              color: "var(--accent)",
+              letterSpacing: 2,
+              fontStyle: "normal",
+              padding: "0 4px"
+            }}>{blank}</span>
+          )}
+        </span>
+      ))}
+    </span>
+  );
+
+  return (
+    <div className="page">
+      <div className="fc-progress">{(index % pool.length) + 1} / {pool.length}</div>
+      <div className="progress-bar-wrap">
+        <div className="progress-bar" style={{width:`${((index%pool.length)+1)/pool.length*100}%`}}/>
+      </div>
+
+      {/* Sentence card */}
+      <div style={{
+        background:"var(--surface)", border:"1px solid var(--border)",
+        borderRadius:20, padding:"28px 24px", marginBottom:20, minHeight:160,
+        display:"flex", flexDirection:"column", justifyContent:"space-between"
+      }}>
+        <div style={{fontSize:10, textTransform:"uppercase", letterSpacing:"1.5px", color:"var(--muted)", fontFamily:"'DM Mono',monospace", marginBottom:12}}>
+          填入正確的單字
+        </div>
+        <div style={{fontSize:17, lineHeight:1.8, fontStyle:"italic", color:"var(--text)", flexGrow:1}}>
+          "{sentenceDisplay}"
+        </div>
+        {ex?.source && (
+          <div style={{fontSize:10, color:"var(--accent2)", fontFamily:"'DM Mono',monospace", marginTop:12, textTransform:"uppercase", letterSpacing:"1px"}}>
+            📰 {ex.source}
+          </div>
+        )}
+      </div>
+
+      {/* Definition hint */}
+      <div style={{
+        background:"rgba(232,197,71,0.06)", border:"1px solid rgba(232,197,71,0.15)",
+        borderRadius:12, padding:"12px 16px", marginBottom:20
+      }}>
+        <div style={{fontSize:10, color:"var(--accent)", fontFamily:"'DM Mono',monospace", marginBottom:4, textTransform:"uppercase", letterSpacing:"1px"}}>提示</div>
+        <div style={{fontSize:14, color:"var(--text)"}}>{w.definitions?.[0]}</div>
+        <div style={{fontSize:12, color:"var(--muted)", marginTop:4}}>{w.pos} · {w.word.length} 個字母</div>
+      </div>
+
+      {/* Input */}
+      {!status ? (
+        <div style={{display:"flex", gap:10, marginBottom:16}}>
+          <input
+            ref={inputRef}
+            value={input}
+            onChange={e => setInput(e.target.value)}
+            onKeyDown={e => e.key === "Enter" && check()}
+            placeholder="輸入單字..."
+            style={{
+              flex:1, background:"var(--surface)", border:"1.5px solid var(--border)",
+              borderRadius:12, padding:"14px 16px", color:"var(--text)",
+              fontSize:16, fontFamily:"'DM Mono',monospace", outline:"none",
+              transition:"border-color 0.2s"
+            }}
+            onFocus={e => e.target.style.borderColor="var(--accent)"}
+            onBlur={e => e.target.style.borderColor="var(--border)"}
+          />
+          <button onClick={check} style={{
+            background:"var(--accent)", border:"none", borderRadius:12,
+            padding:"14px 20px", cursor:"pointer", fontSize:16, fontWeight:600,
+            color:"#000", transition:"opacity 0.2s"
+          }}>✓</button>
+        </div>
+      ) : (
+        <div style={{marginBottom:16}}>
+          <div style={{
+            textAlign:"center", fontSize:22, marginBottom:8,
+            color: status==="correct" ? "var(--success)" : "var(--danger)"
+          }}>
+            {status==="correct" ? "🎉 正確！" : `😅 正確答案：${w.word}`}
+          </div>
+          {ex?.translation && (
+            <div style={{
+              background:"var(--card)", borderRadius:10, padding:"10px 14px",
+              fontSize:13, color:"var(--muted)", marginBottom:12, lineHeight:1.6
+            }}>
+              {ex.translation}
+            </div>
+          )}
+          <button className="save-btn" onClick={next}>下一個 →</button>
+        </div>
+      )}
+
+      {/* Shuffle hint */}
+      {!status && (
+        <div style={{textAlign:"center", color:"var(--muted)", fontSize:12}}>
+          按 Enter 確認 · <span style={{cursor:"pointer", textDecoration:"underline"}} onClick={next}>跳過</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── List Page ──────────────────────────────────────────────────────────────
+function ListPage({ words, deleteWord }) {
+  const levelLabel = [0,1,2,3,4,5];
+  return (
+    <div className="page">
+      <div className="section-title">我的單字表 <span style={{color:"var(--muted)",fontSize:16}}>({words.length})</span></div>
+      {words.length === 0 ? (
+        <div className="empty"><div className="empty-icon">📚</div><p>還沒有單字</p></div>
+      ) : (
+        <div className="word-list">
+          {words.map(w => (
+            <div key={w.id} className="word-item">
+              <div className="word-item-left">
+                <div style={{display:"flex", alignItems:"center", gap:8}}>
+                  <div className="word-item-en">{w.word}</div>
+                  <SpeakBtn text={w.word} />
+                </div>
+                <div className="word-item-zh">{w.definitions?.[0]}</div>
+              </div>
+              <div className="word-item-right">
+                <div className={`level-dot l${w.level}`} title={`Level ${w.level}`}/>
+                {isDueToday(w) && <span className="due-badge">今日</span>}
+                <button className="delete-btn" onClick={() => deleteWord(w.id)}>×</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      <div style={{marginTop:20,color:"var(--muted)",fontSize:12,textAlign:"center"}}>
+        🔴 新學 → 🟡 學習中 → 🟢 熟悉
+      </div>
+    </div>
+  );
+}
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
