@@ -1,4 +1,5 @@
-export default async function handler(req, res) {
+
+module.exports = async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).end();
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return res.status(500).json({ error: "Missing API key" });
@@ -17,4 +18,4 @@ export default async function handler(req, res) {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
-}
+};
