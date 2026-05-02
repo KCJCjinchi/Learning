@@ -928,17 +928,34 @@ function SpellingPage({ words, updateWord }) {
           {status==="wrong"&&<div style={{color:"var(--muted)",marginBottom:12}}>正確答案：{target.toUpperCase()}</div>}
           <button className="save-btn" onClick={next}>下一個 → {!mobile && <span style={{fontSize:12,opacity:0.6}}>(Enter)</span>}</button>
         </div>
-      ) : mobile ? (
-        <div className="keyboard">
-          {KEYBOARD.map((row, ri) => (
-            <div key={ri} className="key-row">
-              {row.map(k => <button key={k} className={`key${k.length>1?" wide":""}`} style={k==="SPACE"?{flex:1,minWidth:120}:{}} onClick={() => press(k)}>{k==="SPACE"?"空白":k}</button>)}
-            </div>
-          ))}
-        </div>
       ) : (
-        <div style={{textAlign:"center", color:"var(--muted)", fontSize:13, padding:"20px 0", fontFamily:"'DM Mono',monospace"}}>
-          ⌨️ 直接用鍵盤輸入
+        <div style={{display:"flex", gap:10, marginBottom:16}}>
+          <input
+            autoFocus
+            value={input.join("")}
+            onChange={e => {
+              if (status) return;
+              const val = e.target.value.toLowerCase().slice(0, target.length);
+              setInput(val.split(""));
+            }}
+            onKeyDown={e => { if (e.key === "Enter") check(); }}
+            placeholder="輸入單字..."
+            autoCapitalize="none"
+            autoCorrect="off"
+            autoComplete="off"
+            spellCheck="false"
+            style={{
+              flex:1, background:"var(--surface)", border:"1.5px solid var(--accent)",
+              borderRadius:12, padding:"14px 16px", color:"var(--text)",
+              fontSize:18, fontFamily:"'DM Mono',monospace", outline:"none",
+              letterSpacing:4, textTransform:"uppercase"
+            }}
+          />
+          <button onClick={check} style={{
+            background:"var(--accent)", border:"none", borderRadius:12,
+            padding:"14px 20px", cursor:"pointer", fontSize:18, fontWeight:600,
+            color:"#000"
+          }}>✓</button>
         </div>
       )}
     </div>
