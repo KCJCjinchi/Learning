@@ -529,6 +529,24 @@ function saveLocal(w) {
   try { localStorage.setItem(LOCAL_KEY, JSON.stringify(w)); } catch {}
 }
 
+async function loadFromRedis() {
+  try {
+    const res = await fetch("/api/words");
+    if (!res.ok) return null;
+    const data = await res.json();
+    return Array.isArray(data) && data.length > 0 ? data : null;
+  } catch { return null; }
+}
+async function saveToRedis(words) {
+  try {
+    await fetch("/api/words", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(words)
+    });
+  } catch {}
+}
+
 // ── Main App ───────────────────────────────────────────────────────────────
 function App() {
   const [tab, setTab] = useState("search");
@@ -540,6 +558,10 @@ function App() {
     if (local && local.length > 0) return local;
     return NOTION_SEED;
   });
+
+  useEffect(() => {
+    loadFromRedis().then(w => { if (w) { setWords(w); saveLocal(w); } });
+  }, []);
 
   const persistWords = (w) => { setWords(w); saveLocal(w); saveToRedis(w); };
 
