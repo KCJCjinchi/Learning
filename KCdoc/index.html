@@ -817,7 +817,7 @@ function FlashcardPage({ words, updateWord }) {
 }
 
 // ── Spelling Page ──────────────────────────────────────────────────────────
-const KEYBOARD = [["q","w","e","r","t","y","u","i","o","p"],["a","s","d","f","g","h","j","k","l"],["⌫","z","x","c","v","b","n","m","✓"]];
+const KEYBOARD = [["q","w","e","r","t","y","u","i","o","p"],["a","s","d","f","g","h","j","k","l"],["⌫","z","x","c","v","b","n","m","✓"],["␣"]];
 const isMobile = () => /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || window.matchMedia("(pointer: coarse)").matches;
 
 function SpellingPage({ words, updateWord }) {
@@ -846,7 +846,8 @@ function SpellingPage({ words, updateWord }) {
     if (status) return;
     if (k === "⌫") { setInput(i => i.slice(0, -1)); return; }
     if (k === "✓") { check(); return; }
-    if (/^[a-z]$/.test(k) && input.length < target.length) setInput(i => [...i, k]);
+    if (k === "␣") k = " ";
+    if (/^[a-z ]$/.test(k) && input.length < target.length) setInput(i => [...i, k]);
   };
 
   const check = () => {
@@ -885,8 +886,8 @@ function SpellingPage({ words, updateWord }) {
         });
         return;
       }
-      if (/^[a-zA-Z]$/.test(e.key)) {
-        setInput(cur => cur.length < curTarget.length ? [...cur, e.key.toLowerCase()] : cur);
+      if (/^[a-zA-Z ]$/.test(e.key)) {
+        setInput(cur => cur.length < curTarget.length ? [...cur, e.key === " " ? " " : e.key.toLowerCase()] : cur);
       }
     };
     window.addEventListener("keydown", handler);
