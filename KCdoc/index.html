@@ -34,6 +34,15 @@ function isDueToday(word) {
   return !word.nextReview || word.nextReview <= now.getTime();
 }
 
+function shuffle(arr) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
 function randEx(w) {
   const exs = w.examples;
   if (!exs || exs.length === 0) return { sentence: w.example || "", translation: "", source: "" };
@@ -749,7 +758,9 @@ function FlashcardPage({ words, updateWord }) {
   const [mode, setMode] = useState("all"); // all | due
   const exRef = useRef(null);
 
-  const pool = mode === "due" ? words.filter(isDueToday) : words;
+  const basePool = mode === "due" ? words.filter(isDueToday) : words;
+  const [pool, setPool] = useState(() => shuffle(basePool));
+  useEffect(() => { setPool(shuffle(mode === "due" ? words.filter(isDueToday) : words)); setIndex(0); setFlipped(false); }, [mode]);
 
   if (pool.length === 0) return (
     <div className="page">
@@ -827,7 +838,9 @@ function SpellingPage({ words, updateWord }) {
   const [mode, setMode] = useState("all");
   const mobile = isMobile();
 
-  const pool = mode === "due" ? words.filter(isDueToday) : words;
+  const basePool2 = mode === "due" ? words.filter(isDueToday) : words;
+  const [pool, setPool] = useState(() => shuffle(basePool2));
+  useEffect(() => { setPool(shuffle(mode === "due" ? words.filter(isDueToday) : words)); setIndex(0); }, [mode]);
 
   if (pool.length === 0) return (
     <div className="page">
@@ -851,8 +864,9 @@ function SpellingPage({ words, updateWord }) {
   };
 
   const check = () => {
-    if (input.length !== target.length) return;
-    const correct = input.join("") === target;
+    const joined = input.join("").toLowerCase();
+    if (joined.length !== target.length) return;
+    const correct = joined === target;
     setStatus(correct ? "correct" : "wrong");
     if (correct) updateWord(w.id, { level: Math.min(w.level+1,5), nextReview: nextReview(Math.min(w.level+1,5)) });
   };
@@ -916,7 +930,7 @@ function SpellingPage({ words, updateWord }) {
           const letter = status ? target[i] : input[i] || "";
           let cls = "letter-box";
           if (status === "correct") cls += " correct";
-          else if (status === "wrong") cls += input[i] === target[i] ? " correct" : " wrong";
+          else if (status === "wrong") cls += (input[i] || "").toLowerCase() === target[i] ? " correct" : " wrong";
           else if (input[i]) cls += " filled";
           return <div key={i} className={cls}>{letter.toUpperCase()}</div>;
         })}
@@ -1069,7 +1083,7 @@ function DailySpelling({ w, onDone }) {
           const letter = status ? target[i] : input[i] || "";
           let cls = "letter-box";
           if (status === "correct") cls += " correct";
-          else if (status === "wrong") cls += input[i] === target[i] ? " correct" : " wrong";
+          else if (status === "wrong") cls += (input[i] || "").toLowerCase() === target[i] ? " correct" : " wrong";
           else if (input[i]) cls += " filled";
           return <div key={i} className={cls}>{letter.toUpperCase()}</div>;
         })}
@@ -1100,7 +1114,8 @@ function FillPage({ words, updateWord }) {
   const [ex, setEx] = useState(null);
   const inputRef = useRef(null);
 
-  const pool = words.length > 0 ? words : [];
+  const [pool, setPool] = useState(() => shuffle(words));
+  useEffect(() => { setPool(shuffle(words)); setIndex(0); }, [words.length]);
 
   const w = pool[index % Math.max(pool.length, 1)];
 
@@ -1262,7 +1277,8 @@ function FillPage({ words, updateWord }) {
 
 // ── List Page ──────────────────────────────────────────────────────────────
 function ListPage({ words, deleteWord }) {
-  const levelLabel = [0,1,2,3,4,5];
+  const [expanded, setExpanded] = useState(null);
+
   return (
     <div className="page">
       <div className="section-title">我的單字表 <span style={{color:"var(--muted)",fontSize:16}}>({words.length})</span></div>
@@ -1271,19 +1287,92 @@ function ListPage({ words, deleteWord }) {
       ) : (
         <div className="word-list">
           {words.map(w => (
-            <div key={w.id} className="word-item">
-              <div className="word-item-left">
-                <div style={{display:"flex", alignItems:"center", gap:8}}>
-                  <div className="word-item-en">{w.word}</div>
-                  <SpeakBtn text={w.word} />
+            <div key={w.id} style={{
+              background:"var(--surface)", border:`1px solid ${expanded===w.id?"var(--accent)":"var(--border)"}`,
+              borderRadius:14, overflow:"hidden", transition:"border-color 0.2s"
+            }}>
+              {/* Header row */}
+              <div style={{display:"flex", alignItems:"center", justifyContent:"space-between", padding:"14px 16px", cursor:"pointer"}}
+                onClick={() => setExpanded(expanded===w.id ? null : w.id)}>
+                <div style={{flex:1}}>
+                  <div style={{display:"flex", alignItems:"center", gap:8}}>
+                    <div className="word-item-en">{w.word}</div>
+                    <SpeakBtn text={w.word} />
+                    <span style={{fontSize:11, color:"var(--accent)", fontFamily:"'DM Mono',monospace", background:"rgba(232,197,71,0.1)", padding:"2px 8px", borderRadius:6}}>{w.pos}</span>
+                  </div>
+                  <div className="word-item-zh">{w.definitions?.[0]}</div>
                 </div>
-                <div className="word-item-zh">{w.definitions?.[0]}</div>
+                <div style={{display:"flex", flexDirection:"column", alignItems:"flex-end", gap:4}}>
+                  <div className={`level-dot l${w.level}`}/>
+                  {isDueToday(w) && <span className="due-badge">今日</span>}
+                  <span style={{color:"var(--muted)", fontSize:16}}>{expanded===w.id?"▲":"▼"}</span>
+                </div>
               </div>
-              <div className="word-item-right">
-                <div className={`level-dot l${w.level}`} title={`Level ${w.level}`}/>
-                {isDueToday(w) && <span className="due-badge">今日</span>}
-                <button className="delete-btn" onClick={() => deleteWord(w.id)}>×</button>
-              </div>
+
+              {/* Expanded detail */}
+              {expanded === w.id && (
+                <div style={{borderTop:"1px solid var(--border)", padding:"16px"}}>
+                  {/* All definitions */}
+                  <div style={{marginBottom:14}}>
+                    <div className="section-label">字義</div>
+                    <ul style={{listStyle:"none", display:"flex", flexDirection:"column", gap:6}}>
+                      {w.definitions?.map((d, i) => (
+                        <li key={i} style={{fontSize:14, lineHeight:1.5}}>
+                          <span style={{color:"var(--accent)", marginRight:8}}>·</span>{d}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+
+                  {/* Examples */}
+                  {w.examples?.length > 0 && (
+                    <div style={{marginBottom:14}}>
+                      <div className="section-label">例句</div>
+                      {w.examples.map((ex, i) => (
+                        <div key={i} style={{marginBottom: i < w.examples.length-1 ? 12 : 0}}>
+                          {ex.source && <div style={{fontSize:10, color:"var(--accent2)", fontFamily:"'DM Mono',monospace", marginBottom:3, textTransform:"uppercase", letterSpacing:"1px"}}>📰 {ex.source}</div>}
+                          <div style={{fontStyle:"italic", fontSize:13, color:"var(--text)", lineHeight:1.6}}>"{ex.sentence}"</div>
+                          <div style={{fontSize:12, color:"var(--muted)", marginTop:3}}>{ex.translation}</div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Roots */}
+                  {w.roots?.length > 0 && (
+                    <div style={{marginBottom:14}}>
+                      <div className="section-label">字根字詞</div>
+                      <div style={{display:"flex", flexWrap:"wrap", gap:8}}>
+                        {w.roots.map((r, i) => (
+                          <div key={i} style={{background:"var(--card)", border:"1px solid var(--border)", borderRadius:10, padding:"5px 12px", fontSize:13, fontFamily:"'DM Mono',monospace"}}>
+                            <span style={{color:"var(--accent)"}}>{r.root}</span> {r.meaning}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Related */}
+                  {w.related?.length > 0 && (
+                    <div style={{marginBottom:14}}>
+                      <div className="section-label">相關單字</div>
+                      <div style={{display:"flex", flexWrap:"wrap", gap:8}}>
+                        {w.related.map((r, i) => (
+                          <span key={i} style={{background:"rgba(74,158,255,0.1)", color:"var(--accent2)", border:"1px solid rgba(74,158,255,0.2)", borderRadius:8, padding:"4px 10px", fontSize:13}}>{r}</span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Delete */}
+                  <button onClick={() => deleteWord(w.id)} style={{
+                    width:"100%", padding:"10px", marginTop:4,
+                    background:"rgba(224,92,92,0.1)", border:"1px solid rgba(224,92,92,0.3)",
+                    borderRadius:10, color:"var(--danger)", cursor:"pointer", fontSize:14,
+                    fontFamily:"'DM Sans',sans-serif"
+                  }}>刪除這個單字</button>
+                </div>
+              )}
             </div>
           ))}
         </div>
