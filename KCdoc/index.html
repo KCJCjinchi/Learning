@@ -189,12 +189,23 @@ async function deleteFromNotion(notionId) {
 }
 
 // ── Text-to-Speech ─────────────────────────────────────────────────────────
+function getBritishVoice() {
+  const voices = window.speechSynthesis.getVoices();
+  return voices.find(v => v.lang === "en-GB") ||
+         voices.find(v => v.name.includes("Daniel")) ||
+         voices.find(v => v.name.includes("British")) ||
+         voices.find(v => v.lang.startsWith("en-GB")) ||
+         null;
+}
+
 function speak(text) {
   if (!window.speechSynthesis) return;
   window.speechSynthesis.cancel();
   const u = new SpeechSynthesisUtterance(text);
+  const v = getBritishVoice();
+  if (v) u.voice = v;
   u.lang = "en-GB";
-  u.rate = 0.9;
+  u.rate = 0.85;
   window.speechSynthesis.speak(u);
 }
 
@@ -205,7 +216,9 @@ function SpeakBtn({ text, style: s }) {
     if (!window.speechSynthesis) return;
     window.speechSynthesis.cancel();
     const u = new SpeechSynthesisUtterance(text);
-    u.lang = "en-GB"; u.rate = 0.9;
+    const v = getBritishVoice();
+    if (v) u.voice = v;
+    u.lang = "en-GB"; u.rate = 0.85;
     u.onstart = () => setSpeaking(true);
     u.onend = () => setSpeaking(false);
     window.speechSynthesis.speak(u);
@@ -838,7 +851,7 @@ const isMobile = () => /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || 
 
 function SpellingPage({ words, updateWord }) {
   const [index, setIndex] = useState(0);
-  const [input, setInput] = useState([]);
+  const [input, setInput] = useState("");
   const [status, setStatus] = useState(null);
   const [mode, setMode] = useState("all");
   const mobile = isMobile();
@@ -865,21 +878,20 @@ function SpellingPage({ words, updateWord }) {
     if (k === "⌫") { setInput(i => i.slice(0, -1)); return; }
     if (k === "✓") { check(); return; }
     if (k === "␣" || k === "SPACE") k = " ";
-    if (/^[a-z ]$/.test(k) && input.length < target.length) setInput(i => [...i, k]);
+    if (/^[a-z ]$/.test(k) && input.length < target.length) setInput(i => i + k);
   };
 
   const check = () => {
-    const joined = input.join("").toLowerCase();
+    const joined = input.toLowerCase();
     if (joined.length !== target.length) return;
     const correct = joined === target;
     setStatus(correct ? "correct" : "wrong");
     if (correct) updateWord(w.id, { level: Math.min(w.level+1,5), nextReview: nextReview(Math.min(w.level+1,5)) });
   };
 
-  const next = () => { setInput([]); setStatus(null); setIndex(i => (i+1) % pool.length); };
+  const next = () => { setInput(""); setStatus(null); setIndex(i => (i+1) % pool.length); };
 
-
-  useEffect(() => { setInput([]); setStatus(null); }, [index]);
+  useEffect(() => { setInput(""); setStatus(null); }, [index]);
 
   return (
     <div className="page">
@@ -917,11 +929,11 @@ function SpellingPage({ words, updateWord }) {
         <div style={{display:"flex", gap:10, marginBottom:16}}>
           <input
             autoFocus
-            value={input.join("")}
+            value={input}
             onChange={e => {
               if (status) return;
               const val = e.target.value.toLowerCase().slice(0, target.length);
-              setInput(val.split(""));
+              setInput(val);
             }}
             onKeyDown={e => { if (e.key === "Enter") check(); }}
             placeholder="輸入單字..."
